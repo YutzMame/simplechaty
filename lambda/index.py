@@ -1,7 +1,7 @@
 # lambda/index.py
 import json
 import os
-import boto3
+import urllib.request
 import re  # 正規表現モジュールをインポート
 from botocore.exceptions import ClientError
 
@@ -14,13 +14,17 @@ def extract_region_from_arn(arn):
         return match.group(1)
     return "us-east-1"  # デフォルト値
 
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# URL
+FASTAPI_URL = os.environ.get("FASTAPI_URL")
 
 def lambda_handler(event, context):
+    if not FASTAPI_URL:
+        print("FASTAPI_URL environment variable is not set.")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"success": False, "error": "Configuration error: FastAPI URL is not set."})
+        }
     try:
         # コンテキストから実行リージョンを取得し、クライアントを初期化
         global bedrock_client
@@ -43,68 +47,70 @@ def lambda_handler(event, context):
         conversation_history = body.get('conversationHistory', [])
         
         print("Processing message:", message)
-        print("Using model:", MODEL_ID)
+        print(f"Calling custom LLM API at: {FASTAPI_URL}/generate")
         
-        # 会話履歴を使用
-        messages = conversation_history.copy()
-        
+       
         # ユーザーメッセージを追加
         messages.append({
             "role": "user",
             "content": message
         })
         
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
+        # fastapi用のリクエストペイロードを構築
+       
         
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
-        }
+        # fastapi用のリクエストペイロード
+        request_payload = {"prompt": message,
+                            "max_new_tokens": 512,
+                            "temperature": 0.7,
+                            "top_p": 0.9,
+                            "do_sample": True }
         
         print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
         
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+         # ペイロードをJSON文字列に変換し、バイト列にエンコード
+        payload_bytes = json.dumps(request_payload).encode('utf-8')
+
+        # FastAPI API のエンドポイントURL
+        url = f"{FASTAPI_URL}/generate"
+
+# urllib.request.Request オブジェクトを作成
+        # method='POST' を明示的に指定
+        req = urllib.request.Request(
+            url,
+            data=payload_bytes,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
         )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
+
+        # urllib.request.urlopen でAPIを呼び出し
+        print("Sending request to FastAPI API...")
+        with urllib.request.urlopen(req) as response:
+            print(f"Received response from FastAPI API. Status code: {response.getcode()}")
+            # 応答ボディを読み込み、デコード
+            response_body_bytes = response.read()
+            response_body_string = response_body_bytes.decode('utf-8')
+
+        # レスポンスをJSONとして解析
+        # FastAPI側のコード app (2).py は {"generated_text": "...", ...} の形式を返す想定 [cite: 1]
+        response_data = json.loads(response_body_string)
+        print("FastAPI API response data:", json.dumps(response_data, default=str))
+
+        # 応答から生成されたテキストを抽出 (FastAPI側のレスポンス構造に合わせて)
+        # app (2).py の generate_simple エンドポイントは "generated_text" を返す [cite: 1]
+        generated_text = response_data.get("generated_text", "Error: Could not get generated text from API response.")
+
+        # Lambdaの応答形式に変換
+        # 元のコードの成功時の戻り値構造 を参考に、フロントエンドが期待する形式に合わせる
+        lambda_response_body = {
+            "success": True,
+            "response": generated_text, }
         
         # 応答の検証
         if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
             raise Exception("No response content from the model")
         
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
+       
         
         # 成功レスポンスの返却
         return {
